@@ -137,11 +137,6 @@ class HintFilmIzle : MainAPI() {
         }
 
         val plot = document.selectFirst(".description, .plot, .summary, .synopsis, .film-description, .entry-content p")?.text()?.trim()
-        val tags = document.select("a[href*='/tur/'], .genre a, .genres a, .category a")
-            .map { it.text().trim() }
-            .filter { it.isNotBlank() }
-            .distinct()
-        val year = Regex("\\b(19|20)\\d{2}\\b").find(document.text())?.value?.toIntOrNull()
 
         val episodes = document.select("a[href]").mapNotNull { a ->
             val text = a.text().trim()
@@ -188,8 +183,9 @@ class HintFilmIzle : MainAPI() {
             .distinct()
 
         frames.forEach { frame ->
-            runCatching { loadExtractor(frame, data, subtitleCallback, callback) }
-                .onFailure { runCatching { loadExtractor(frame, data, callback) } }
+            runCatching {
+                loadExtractor(frame, data, subtitleCallback, callback)
+            }
         }
         return frames.isNotEmpty()
     }
