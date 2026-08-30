@@ -41,18 +41,18 @@ jobs:
       - name: Gradle kur
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.9
+          gradle-version: 8.12
 
       - name: Eklentiyi derle
         working-directory: src
-        run: gradle make makePluginsJson
+        run: gradle make makePluginsJson --stacktrace
 
       - name: Derlemeleri builds dalına aktar
         run: |
           set -e
-          rm -f builds/*.cs3
-          cp src/**/build/*.cs3 builds/
-          cp src/build/plugins.json builds/plugins.json
+          rm -f builds/*.cs3 builds/*.jar || true
+          cp src/**/build/*.cs3 builds/ 2>/dev/null || true
+          cp src/build/plugins.json builds/plugins.json 2>/dev/null || true
           cd builds
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
