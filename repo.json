@@ -1,0 +1,8 @@
+{
+  "name": "Hindu - HintFilmİzle",
+  "description": "HintFilmİzle.com için Hint film ve dizi eklentisi",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/liberta09/Hindu-/builds/plugins.json"
+  ]
+}
