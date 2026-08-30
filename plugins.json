@@ -1,10 +1,10 @@
 [
     {
         "iconUrl": "https://www.google.com/s2/favicons?domain=hintfilmizle.com&sz=%size%",
-        "fileHash": "sha256-cae63c6a31aa7fa4f482716e2e21b674f09f742466bb6fadee7ba10836c6bb6d",
+        "fileHash": "sha256-d3c0e848edaaf4b5f613a630d34e6144615f56f5b7b53e2de4f44272e4f94685",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/liberta09/Hindu-",
-        "fileSize": 22310,
+        "fileSize": 23910,
         "status": 1,
         "language": "tr",
         "authors": [
@@ -14,7 +14,7 @@
             "Movie",
             "TvSeries"
         ],
-        "version": 2,
+        "version": 3,
         "internalName": "HintFilmIzle",
         "description": "HintFilm\u0130zle.com i\u00e7in Hint film ve dizi eklentisi",
         "url": "https://raw.githubusercontent.com/liberta09/Hindu-/builds/HintFilmIzle.cs3",
