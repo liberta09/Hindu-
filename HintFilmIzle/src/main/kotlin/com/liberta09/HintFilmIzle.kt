@@ -19,7 +19,6 @@ import com.lagradost.cloudstream3.newTvSeriesSearchResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.jsoup.nodes.Document
@@ -136,21 +135,18 @@ class HintFilmIzle : MainAPI() {
 
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
-    /** Parse season/episode from slug or label text. */
     private fun parseEpisodeInfo(href: String, text: String): Pair<Int?, Int>? {
-        // URL: ...-3-sezon-8-bolum-izle
         Regex("""(\d+)[-_]?sezon[-_](\d+)[-_]?bolum""", RegexOption.IGNORE_CASE).find(href)?.let {
-            return it.groupValues[1].toIntOrNull() to (it.groupValues[2].toIntOrNull() ?: return null)
+            val ep = it.groupValues[2].toIntOrNull() ?: return null
+            return it.groupValues[1].toIntOrNull() to ep
         }
-        // Text: "8.Bölüm" / "1. Bölüm" / "Bölüm 3"
         Regex("""(\d+)\s*[.]\s*Bölüm""", RegexOption.IGNORE_CASE).find(text)?.let {
-            return null to (it.groupValues[1].toIntOrNull() ?: return null)
+            val ep = it.groupValues[1].toIntOrNull() ?: return null
+            return null to ep
         }
         Regex("""Bölüm\s*(\d+)""", RegexOption.IGNORE_CASE).find(text)?.let {
-            return null to (it.groupValues[1].toIntOrNull() ?: return null)
-        }
-        Regex("""(\d+)\s*sezon\s*(\d+)""", RegexOption.IGNORE_CASE).find(text)?.let {
-            return it.groupValues[1].toIntOrNull() to (it.groupValues[2].toIntOrNull() ?: return null)
+            val ep = it.groupValues[1].toIntOrNull() ?: return null
+            return null to ep
         }
         return null
     }
@@ -170,34 +166,28 @@ class HintFilmIzle : MainAPI() {
 
         val plot = document.selectFirst(".description, .plot, .summary, .synopsis, .film-description, .entry-content p")?.text()?.trim()
 
-        // Build episode list from sibling links
         val episodes = document.select("a[href]").mapNotNull { a ->
             val href = fixUrlNull(a.attr("href")) ?: return@mapNotNull null
             if (!href.startsWith(mainUrl)) return@mapNotNull null
             if (!href.contains("bolum", ignoreCase = true)) return@mapNotNull null
             val text = a.text().replace(Regex("\\s+"), " ").trim()
             val info = parseEpisodeInfo(href, text) ?: return@mapNotNull null
-            val (season, episode) = info
+            val seasonNum = info.first
+            val episodeNum = info.second
             newEpisode(href) {
-                name = text.ifBlank { "Bölüm $episode" }
-                this.episode = episode
-                this.season = season
+                name = text.ifBlank { "Bölüm $episodeNum" }
+                this.episode = episodeNum
+                this.season = seasonNum
             }
-        }.distinctBy { it.data }.sortedWith(compareBy({ it.season ?: 1 }, { it.episode }))
+        }.distinctBy { it.data }
 
-        val pageHasEmbed = document.select("[data-frame]").any {
-            val f = it.attr("data-frame")
-            f.isNotBlank() && !f.contains("player.hintfilmizle.com", ignoreCase = true)
-        }
-
-        // Critical: never return empty TvSeries (CloudStream shows "Bağlantı bulunamadı")
+        // Never return empty TvSeries — CloudStream shows "Bağlantı bulunamadı"
         return if (episodes.isNotEmpty()) {
             newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                 posterUrl = poster
                 this.plot = plot
             }
         } else {
-            // Single page with player (movie or single-episode) — playable via loadLinks(url)
             newMovieLoadResponse(title, url, TvType.Movie, url) {
                 posterUrl = poster
                 this.plot = plot
@@ -254,7 +244,7 @@ class HintFilmIzle : MainAPI() {
         }.getOrNull() ?: return false
 
         val mp4 = Regex(
-            """https?://seed[^"'\s]+\.bitchute\.com/[^"'\s]+\.mp4""",
+            "https?://seed[^\"'\\s]+\\.bitchute\\.com/[^\"'\\s]+\\.mp4",
             RegexOption.IGNORE_CASE
         ).find(html)?.value ?: return false
 
@@ -273,7 +263,6 @@ class HintFilmIzle : MainAPI() {
         return true
     }
 
-    /** Fallback when built-in OkRu extractor does not match. */
     private suspend fun extractOkRu(
         embedUrl: String,
         callback: (ExtractorLink) -> Unit
@@ -285,37 +274,24 @@ class HintFilmIzle : MainAPI() {
             ).text
         }.getOrNull() ?: return false
 
-        val decoded = html
-            .replace("\\"", "\"")
-            .replace("\\\\", "\\")
-
-        val videosJson = Regex(""""videos"\s*:\s*(\[[^]]*])""").find(decoded)?.groupValues?.get(1)
-            ?: return false
-
         var found = false
-        Regex(""""name"\s*:\s*"([^"]+)"\s*,\s*"url"\s*:\s*"([^"]+)"""").findAll(videosJson).forEach { m ->
-            val qName = m.groupValues[1]
-            var videoUrl = m.groupValues[2].replace("\\/", "/")
+        // Match url fields that look like media
+        Regex(""""url"\s*:\s*"(//[^\"]+|https?:[^\"]+)"""").findAll(html).forEach { m ->
+            var videoUrl = m.groupValues[1].replace("\\/", "/")
             if (videoUrl.startsWith("//")) videoUrl = "https:$videoUrl"
-            val quality = qName.uppercase()
-                .replace("MOBILE", "144p")
-                .replace("LOWEST", "240p")
-                .replace("LOW", "360p")
-                .replace("SD", "480p")
-                .replace("HD", "720p")
-                .replace("FULL", "1080p")
-                .replace("QUAD", "1440p")
-                .replace("ULTRA", "4k")
+            if (!videoUrl.contains("okcdn") && !videoUrl.contains("mycdn") &&
+                !videoUrl.contains(".mp4") && !videoUrl.contains("video")
+            ) return@forEach
 
             callback(
                 newExtractorLink(
                     source = "OkRu",
-                    name = "OkRu $qName",
+                    name = "OkRu",
                     url = videoUrl,
                     type = ExtractorLinkType.VIDEO
                 ) {
                     this.referer = "https://ok.ru/"
-                    this.quality = getQualityFromName(quality)
+                    this.quality = Qualities.Unknown.value
                 }
             )
             found = true
@@ -345,7 +321,7 @@ class HintFilmIzle : MainAPI() {
         }
 
         Regex(
-            """(https?://[^"'\\s<>]+?\.(?:m3u8|mp4)(?:\?[^"'\\s<>]*)?)""",
+            "(https?://[^\"'\\s<>]+?\\.(?:m3u8|mp4)(?:\\?[^\"'\\s<>]*)?)",
             RegexOption.IGNORE_CASE
         ).findAll(html).forEach { m ->
             val stream = m.groupValues[1]
