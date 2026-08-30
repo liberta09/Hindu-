@@ -17,7 +17,10 @@ import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import com.lagradost.cloudstream3.newTvSeriesSearchResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
@@ -47,7 +50,7 @@ class HintFilmIzle : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page <= 1) request.data else "${request.data.removeSuffix("/")}/page/$page"
         val document = app.get(url).document
-        val results = document.select("article, .film-box, .movie-item, .poster, .movie, .film, .item")
+        val results = document.select("article, .film-box, .movie-item, .poster, .movie, .film, .item, .belink a, .movie-box")
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
             .take(60)
@@ -85,7 +88,7 @@ class HintFilmIzle : MainAPI() {
         if (path.isBlank() || path == "/film" || path == "/film-izle" || path == "/trendler" || path.startsWith("/tur/") || path.startsWith("/kategori") || path.startsWith("/koleksiyon")) return null
 
         val title = listOf(
-            card.selectFirst("h1,h2,h3,h4,h5,.title,.name,.film-name,.movie-title")?.text(),
+            card.selectFirst("h1,h2,h3,h4,h5,.title,.name,.film-name,.movie-title,.truncate")?.text(),
             card.selectFirst("img")?.attr("alt"),
             anchor.attr("title"),
             anchor.text()
@@ -93,7 +96,7 @@ class HintFilmIzle : MainAPI() {
 
         val poster = imageUrl(card)
         val text = card.text()
-        val isSeries = text.contains("dizi", true) || text.contains("sezon", true) || text.contains("bölüm", true) || path.startsWith("/dizi/") || path.contains("/series/")
+        val isSeries = text.contains("dizi", true) || text.contains("sezon", true) || text.contains("bölüm", true) || path.startsWith("/dizi/") || path.contains("/series/") || path.contains("bolum")
 
         return if (isSeries) {
             newTvSeriesSearchResponse(title, href) { posterUrl = poster }
@@ -112,7 +115,7 @@ class HintFilmIzle : MainAPI() {
         for (url in urls) {
             val results = runCatching {
                 app.get(url).document
-                    .select("article, .film-box, .movie-item, .poster, .movie, .film, .item")
+                    .select("article, .film-box, .movie-item, .poster, .movie, .film, .item, .movie-box")
                     .mapNotNull { it.toSearchResult() }
                     .distinctBy { it.url }
             }.getOrNull().orEmpty()
@@ -173,20 +176,116 @@ class HintFilmIzle : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = app.get(data).document
-        val frames = document.select("iframe[src], iframe[data-src], iframe[data-lazy-src], video source[src], source[src]")
-            .mapNotNull { element ->
-                val raw = element.attr("src").ifBlank {
-                    element.attr("data-src").ifBlank { element.attr("data-lazy-src") }
-                }
-                fixUrlNull(raw)
-            }
-            .distinct()
+        val html = document.html()
 
-        frames.forEach { frame ->
-            runCatching {
+        val frames = mutableSetOf<String>()
+
+        // 1) data-frame attribute (site uses this for player links)
+        document.select("[data-frame]").forEach { el ->
+            fixUrlNull(el.attr("data-frame"))?.let { frames.add(it) }
+        }
+
+        // 2) Classic iframes / sources
+        document.select("iframe[src], iframe[data-src], iframe[data-lazy-src], video source[src], source[src]").forEach { el ->
+            val raw = el.attr("src").ifBlank {
+                el.attr("data-src").ifBlank { el.attr("data-lazy-src") }
+            }
+            fixUrlNull(raw)?.let { frames.add(it) }
+        }
+
+        // 3) Regex for player.hintfilmizle.com and common embed patterns in HTML
+        Regex(
+            """(?:https?:)?//(?:player\.)?hintfilmizle\.com/embed/[0-9]+""",
+            RegexOption.IGNORE_CASE
+        ).findAll(html).forEach { match ->
+            val url = if (match.value.startsWith("//")) "https:${match.value}" else match.value
+            frames.add(url)
+        }
+
+        // 4) HTML comments: <!--frame:URL-->
+        Regex("<!--\\s*frame:\\s*([^>]+)-->", RegexOption.IGNORE_CASE).findAll(html).forEach { match ->
+            fixUrlNull(match.groupValues[1].trim())?.let { frames.add(it) }
+        }
+
+        var found = false
+
+        for (frame in frames) {
+            // Try built-in extractors first
+            val extracted = runCatching {
                 loadExtractor(frame, data, subtitleCallback, callback)
+            }.getOrDefault(false)
+
+            if (extracted) {
+                found = true
+                continue
+            }
+
+            // Fallback: open the embed page and look for m3u8 / mp4
+            if (frame.contains("player.hintfilmizle.com") || frame.contains("/embed/")) {
+                runCatching {
+                    val playerDoc = app.get(
+                        frame,
+                        referer = data,
+                        headers = mapOf(
+                            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                        )
+                    ).document
+                    val playerHtml = playerDoc.html()
+
+                    // Nested iframes
+                    playerDoc.select("iframe[src], iframe[data-src]").forEach { el ->
+                        val nested = fixUrlNull(el.attr("src").ifBlank { el.attr("data-src") })
+                        if (nested != null) {
+                            runCatching { loadExtractor(nested, frame, subtitleCallback, callback) }
+                                .onSuccess { if (it) found = true }
+                        }
+                    }
+
+                    // Direct m3u8 / mp4 links
+                    Regex(
+                        """(https?://[^"'\\s]+?\.(?:m3u8|mp4)[^"'\\s]*)""",
+                        RegexOption.IGNORE_CASE
+                    ).findAll(playerHtml).forEach { m ->
+                        val stream = m.groupValues[1]
+                        callback(
+                            newExtractorLink(
+                                name,
+                                name,
+                                stream,
+                                type = if (stream.contains("m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = frame
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                        found = true
+                    }
+
+                    // file: "..." patterns (JWPlayer etc.)
+                    Regex(
+                        """(?:file|source|src)\\s*[:=]\\s*["'](https?://[^"']+)["']""",
+                        RegexOption.IGNORE_CASE
+                    ).findAll(playerHtml).forEach { m ->
+                        val stream = m.groupValues[1]
+                        if (stream.contains(".m3u8") || stream.contains(".mp4")) {
+                            callback(
+                                newExtractorLink(
+                                    name,
+                                    name,
+                                    stream,
+                                    type = if (stream.contains("m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                                ) {
+                                    this.referer = frame
+                                    this.quality = Qualities.Unknown.value
+                                }
+                            )
+                            found = true
+                        }
+                    }
+                }
             }
         }
-        return frames.isNotEmpty()
+
+        return found || frames.isNotEmpty()
     }
 }
