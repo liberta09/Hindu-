@@ -34,6 +34,10 @@ class HintFilmIzle : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
+    private val headers = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+
     override val mainPage = mainPageOf(
         "$mainUrl/film" to "Filmler",
         "$mainUrl/film-izle" to "Filmler & Diziler",
@@ -49,8 +53,8 @@ class HintFilmIzle : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page <= 1) request.data else "${request.data.removeSuffix("/")}/page/$page"
-        val document = app.get(url).document
-        val results = document.select("article, .film-box, .movie-item, .poster, .movie, .film, .item, .belink a, .movie-box")
+        val document = app.get(url, headers = headers).document
+        val results = document.select("article, .film-box, .movie-item, .poster, .movie, .film, .item, .movie-box")
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
             .take(60)
@@ -85,7 +89,9 @@ class HintFilmIzle : MainAPI() {
         val href = fixUrlNull(anchor.attr("href").trim()) ?: return null
         if (!href.startsWith(mainUrl)) return null
         val path = href.removePrefix(mainUrl).substringBefore("?").removeSuffix("/")
-        if (path.isBlank() || path == "/film" || path == "/film-izle" || path == "/trendler" || path.startsWith("/tur/") || path.startsWith("/kategori") || path.startsWith("/koleksiyon")) return null
+        if (path.isBlank() || path == "/film" || path == "/film-izle" || path == "/trendler" ||
+            path.startsWith("/tur/") || path.startsWith("/kategori") || path.startsWith("/koleksiyon")
+        ) return null
 
         val title = listOf(
             card.selectFirst("h1,h2,h3,h4,h5,.title,.name,.film-name,.movie-title,.truncate")?.text(),
@@ -96,7 +102,8 @@ class HintFilmIzle : MainAPI() {
 
         val poster = imageUrl(card)
         val text = card.text()
-        val isSeries = text.contains("dizi", true) || text.contains("sezon", true) || text.contains("bölüm", true) || path.startsWith("/dizi/") || path.contains("/series/") || path.contains("bolum")
+        val isSeries = text.contains("dizi", true) || text.contains("sezon", true) ||
+            text.contains("bölüm", true) || path.contains("bolum") || path.contains("sezon")
 
         return if (isSeries) {
             newTvSeriesSearchResponse(title, href) { posterUrl = poster }
@@ -114,7 +121,7 @@ class HintFilmIzle : MainAPI() {
         )
         for (url in urls) {
             val results = runCatching {
-                app.get(url).document
+                app.get(url, headers = headers).document
                     .select("article, .film-box, .movie-item, .poster, .movie, .film, .item, .movie-box")
                     .mapNotNull { it.toSearchResult() }
                     .distinctBy { it.url }
@@ -127,7 +134,7 @@ class HintFilmIzle : MainAPI() {
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
     override suspend fun load(url: String): LoadResponse? {
-        val document = app.get(url).document
+        val document = app.get(url, headers = headers).document
         val title = document.selectFirst("h1, .film h1, .movie-title, .entry-title, .single-title, .post-title")?.text()?.trim()
             ?: document.title().substringBefore("|").trim().takeIf { it.isNotBlank() }
             ?: return null
@@ -144,7 +151,10 @@ class HintFilmIzle : MainAPI() {
         val episodes = document.select("a[href]").mapNotNull { a ->
             val text = a.text().trim()
             val href = fixUrlNull(a.attr("href"))
-            val match = Regex("(?:S|Sezon\\s*)?(\\d+)?\\s*(?:x|[.]?Bölüm|Episode)\\s*(\\d+)", RegexOption.IGNORE_CASE).find(text)
+            val match = Regex(
+                "(?:S|Sezon\\s*)?(\\d+)?\\s*(?:x|[.]?Bölüm|Episode)\\s*(\\d+)",
+                RegexOption.IGNORE_CASE
+            ).find(text)
             val episodeNumber = match?.groupValues?.lastOrNull()?.toIntOrNull()
             if (href != null && episodeNumber != null) {
                 newEpisode(href) {
@@ -154,7 +164,10 @@ class HintFilmIzle : MainAPI() {
             } else null
         }.distinctBy { it.data }
 
-        val isSeries = episodes.isNotEmpty() || document.text().contains("sezon", true) || document.text().contains("bölüm", true) || url.contains("/dizi/")
+        val isSeries = episodes.isNotEmpty() ||
+            document.text().contains("sezon", true) ||
+            document.text().contains("bölüm", true) ||
+            url.contains("bolum", true)
 
         return if (isSeries) {
             newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
@@ -169,123 +182,191 @@ class HintFilmIzle : MainAPI() {
         }
     }
 
+    /** Normalize protocol-relative and relative embed URLs. */
+    private fun normalizeEmbed(raw: String?): String? {
+        if (raw.isNullOrBlank()) return null
+        val trimmed = raw.trim()
+        if (trimmed.startsWith("//")) return "https:$trimmed"
+        return fixUrlNull(trimmed)
+    }
+
+    /** Collect every player/embed URL from the detail page. */
+    private fun collectEmbedUrls(document: org.jsoup.nodes.Document): List<String> {
+        val frames = linkedSetOf<String>()
+        val html = document.html()
+
+        // Site primary: <a data-frame="https://...">TEKPART</a>
+        document.select("[data-frame]").forEach { el ->
+            normalizeEmbed(el.attr("data-frame"))?.let { frames.add(it) }
+        }
+
+        // iframes (including those injected in post content)
+        document.select("iframe[src], iframe[data-src], iframe[data-lazy-src]").forEach { el ->
+            val raw = el.attr("src").ifBlank {
+                el.attr("data-src").ifBlank { el.attr("data-lazy-src") }
+            }
+            normalizeEmbed(raw)?.let { frames.add(it) }
+        }
+
+        // video/source tags
+        document.select("video source[src], source[src], video[src]").forEach { el ->
+            normalizeEmbed(el.attr("src"))?.let { frames.add(it) }
+        }
+
+        // Regex fallback for embeds in raw HTML / WP content
+        Regex(
+            """(?:https?:)?//(?:www\.)?(?:ok\.ru|bitchute\.com|bysevepoin\.com|listeamed\.net|player\.hintfilmizle\.com|filemoon|streamwish|vidhide|dood)[^\s"'<>]+""",
+            RegexOption.IGNORE_CASE
+        ).findAll(html).forEach { m ->
+            normalizeEmbed(m.value)?.let { frames.add(it) }
+        }
+
+        return frames.filter { url ->
+            // Drop dead internal player host (NXDOMAIN) and non-http junk
+            !url.contains("player.hintfilmizle.com", ignoreCase = true) &&
+                (url.startsWith("http://") || url.startsWith("https://"))
+        }
+    }
+
+    private suspend fun extractBitchute(
+        embedUrl: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val html = runCatching {
+            app.get(embedUrl, referer = referer, headers = headers).text
+        }.getOrNull() ?: return false
+
+        // Direct seed CDN mp4: https://seedXXX.bitchute.com/.../ID.mp4
+        val mp4 = Regex(
+            """https?://seed[^"'\s]+\.bitchute\.com/[^"'\s]+\.mp4""",
+            RegexOption.IGNORE_CASE
+        ).find(html)?.value
+
+        if (mp4 != null) {
+            callback(
+                newExtractorLink(
+                    source = name,
+                    name = "BitChute",
+                    url = mp4,
+                    type = ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = embedUrl
+                    this.quality = Qualities.Unknown.value
+                    this.headers = mapOf("Referer" to "https://www.bitchute.com/")
+                }
+            )
+            return true
+        }
+        return false
+    }
+
+    private suspend fun extractGenericStreams(
+        embedUrl: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val response = runCatching {
+            app.get(embedUrl, referer = referer, headers = headers)
+        }.getOrNull() ?: return false
+
+        val html = response.text
+        var found = false
+
+        // Nested iframes → recurse via loadExtractor
+        response.document.select("iframe[src], iframe[data-src]").forEach { el ->
+            val nested = normalizeEmbed(el.attr("src").ifBlank { el.attr("data-src") }) ?: return@forEach
+            if (nested == embedUrl) return@forEach
+            val ok = runCatching {
+                loadExtractor(nested, embedUrl, subtitleCallback, callback)
+            }.getOrDefault(false)
+            if (ok) found = true
+        }
+
+        // Direct m3u8 / mp4 in page source
+        Regex(
+            """(https?://[^"'\\s<>]+?\.(?:m3u8|mp4)(?:\?[^"'\\s<>]*)?)""",
+            RegexOption.IGNORE_CASE
+        ).findAll(html).forEach { m ->
+            val stream = m.groupValues[1]
+            // skip trackers / non-media
+            if (stream.contains("google", true) || stream.contains("facebook", true)) return@forEach
+            callback(
+                newExtractorLink(
+                    source = name,
+                    name = name,
+                    url = stream,
+                    type = if (stream.contains("m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = embedUrl
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+            found = true
+        }
+
+        // JWPlayer / video.js style file:"..."
+        Regex(
+            """(?:file|source|src|sources?)\\s*[:=]\\s*["'](https?://[^"']+)["']""",
+            RegexOption.IGNORE_CASE
+        ).findAll(html).forEach { m ->
+            val stream = m.groupValues[1]
+            if (!stream.contains(".m3u8") && !stream.contains(".mp4")) return@forEach
+            callback(
+                newExtractorLink(
+                    source = name,
+                    name = name,
+                    url = stream,
+                    type = if (stream.contains("m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = embedUrl
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+            found = true
+        }
+
+        return found
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val document = app.get(data).document
-        val html = document.html()
-
-        val frames = mutableSetOf<String>()
-
-        // 1) data-frame attribute (site uses this for player links)
-        document.select("[data-frame]").forEach { el ->
-            fixUrlNull(el.attr("data-frame"))?.let { frames.add(it) }
-        }
-
-        // 2) Classic iframes / sources
-        document.select("iframe[src], iframe[data-src], iframe[data-lazy-src], video source[src], source[src]").forEach { el ->
-            val raw = el.attr("src").ifBlank {
-                el.attr("data-src").ifBlank { el.attr("data-lazy-src") }
-            }
-            fixUrlNull(raw)?.let { frames.add(it) }
-        }
-
-        // 3) Regex for player.hintfilmizle.com and common embed patterns in HTML
-        Regex(
-            """(?:https?:)?//(?:player\.)?hintfilmizle\.com/embed/[0-9]+""",
-            RegexOption.IGNORE_CASE
-        ).findAll(html).forEach { match ->
-            val url = if (match.value.startsWith("//")) "https:${match.value}" else match.value
-            frames.add(url)
-        }
-
-        // 4) HTML comments: <!--frame:URL-->
-        Regex("<!--\\s*frame:\\s*([^>]+)-->", RegexOption.IGNORE_CASE).findAll(html).forEach { match ->
-            fixUrlNull(match.groupValues[1].trim())?.let { frames.add(it) }
-        }
+        val document = app.get(data, headers = headers).document
+        val embeds = collectEmbedUrls(document)
+        if (embeds.isEmpty()) return false
 
         var found = false
 
-        for (frame in frames) {
-            // Try built-in extractors first
-            val extracted = runCatching {
-                loadExtractor(frame, data, subtitleCallback, callback)
+        for (embed in embeds) {
+            // 1) Built-in CloudStream extractors (ok.ru, filemoon, dood, etc.)
+            val viaExtractor = runCatching {
+                loadExtractor(embed, data, subtitleCallback, callback)
             }.getOrDefault(false)
-
-            if (extracted) {
+            if (viaExtractor) {
                 found = true
                 continue
             }
 
-            // Fallback: open the embed page and look for m3u8 / mp4
-            if (frame.contains("player.hintfilmizle.com") || frame.contains("/embed/")) {
-                runCatching {
-                    val playerDoc = app.get(
-                        frame,
-                        referer = data,
-                        headers = mapOf(
-                            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                        )
-                    ).document
-                    val playerHtml = playerDoc.html()
-
-                    // Nested iframes
-                    playerDoc.select("iframe[src], iframe[data-src]").forEach { el ->
-                        val nested = fixUrlNull(el.attr("src").ifBlank { el.attr("data-src") })
-                        if (nested != null) {
-                            runCatching { loadExtractor(nested, frame, subtitleCallback, callback) }
-                                .onSuccess { if (it) found = true }
-                        }
-                    }
-
-                    // Direct m3u8 / mp4 links
-                    Regex(
-                        """(https?://[^"'\\s]+?\.(?:m3u8|mp4)[^"'\\s]*)""",
-                        RegexOption.IGNORE_CASE
-                    ).findAll(playerHtml).forEach { m ->
-                        val stream = m.groupValues[1]
-                        callback(
-                            newExtractorLink(
-                                name,
-                                name,
-                                stream,
-                                type = if (stream.contains("m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                            ) {
-                                this.referer = frame
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
-                        found = true
-                    }
-
-                    // file: "..." patterns (JWPlayer etc.)
-                    Regex(
-                        """(?:file|source|src)\\s*[:=]\\s*["'](https?://[^"']+)["']""",
-                        RegexOption.IGNORE_CASE
-                    ).findAll(playerHtml).forEach { m ->
-                        val stream = m.groupValues[1]
-                        if (stream.contains(".m3u8") || stream.contains(".mp4")) {
-                            callback(
-                                newExtractorLink(
-                                    name,
-                                    name,
-                                    stream,
-                                    type = if (stream.contains("m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                                ) {
-                                    this.referer = frame
-                                    this.quality = Qualities.Unknown.value
-                                }
-                            )
-                            found = true
-                        }
-                    }
+            // 2) BitChute direct mp4
+            if (embed.contains("bitchute.com", ignoreCase = true)) {
+                if (extractBitchute(embed, data, callback)) {
+                    found = true
+                    continue
                 }
+            }
+
+            // 3) Generic scrape of embed page for m3u8/mp4 / nested iframes
+            if (extractGenericStreams(embed, data, subtitleCallback, callback)) {
+                found = true
             }
         }
 
-        return found || frames.isNotEmpty()
+        // Only report success when a real stream was passed to the player
+        return found
     }
 }
