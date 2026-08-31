@@ -32,7 +32,9 @@ class HintFilmIzle : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = request.data + if (page > 1) "/page/$page" else ""
-        val items = app.get(url).document.select("a[href]")
+        val document = app.get(url).document
+        val items = document.select("main a[href], #content a[href], .content a[href], article a[href]")
+            .ifEmpty { document.select("a[href]") }
             .mapNotNull { it.toSearchResponse() }
             .distinctBy { it.url }
             .take(40)
@@ -40,7 +42,9 @@ class HintFilmIzle : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> =
-        app.get(mainUrl + "/?s=" + query.urlEncode()).document.select("a[href]")
+        app.get(mainUrl + "/?s=" + query.urlEncode()).document
+            .select("main a[href], #content a[href], .content a[href], article a[href]")
+            .ifEmpty { app.get(mainUrl + "/?s=" + query.urlEncode()).document.select("a[href]") }
             .mapNotNull { it.toSearchResponse() }
             .distinctBy { it.url }
             .take(40)
@@ -49,21 +53,13 @@ class HintFilmIzle : MainAPI() {
         val href = absUrl("href").takeIf { it.startsWith(mainUrl) } ?: return null
         val path = href.removePrefix(mainUrl).substringBefore("?").removeSuffix("/")
 
-        if (path.isBlank() ||
-            path in setOf(
-                "/film", "/film-izle", "/trendler", "/en-iyiler", "/yeni-filmler",
-                "/yabanci-dizi-izle", "/koleksiyon", "/forum", "/iletisim", "/haberler"
-            ) ||
-            path.startsWith("/kategori/") ||
-            path.startsWith("/tur/") ||
-            path.startsWith("/koleksiyon/") ||
-            path.startsWith("/oyuncu/") ||
-            path.startsWith("/yonetmen/")
-        ) return null
+        // HintFilmIzle'de gerçek içerik URL'leri /film/ ve /diziler/ altında.
+        // Bu filtre, menü/filtre/oyuncu bağlantılarının katalog kartına
+        // dönüşmesini tamamen engeller.
+        val isMovie = path.startsWith("/film/")
+        val isSeries = path.startsWith("/diziler/")
+        if (!isMovie && !isSeries) return null
 
-        // Sadece gerçekten poster taşıyan kart bağlantılarını kabul et.
-        // Böylece filtrelerdeki "Dizi", menü bağlantıları ve diğer metin
-        // bağlantıları katalog öğesi olarak yanlışlıkla eklenmez.
         val image = selectFirst("img") ?: return null
         val rawPoster = image.absUrl("data-src").ifBlank {
             image.absUrl("data-lazy-src").ifBlank { image.absUrl("src") }
@@ -80,9 +76,6 @@ class HintFilmIzle : MainAPI() {
 
         val year = Regex("\\b(19|20)\\d{2}\\b")
             .find(parent()?.text().orEmpty())?.value?.toIntOrNull()
-
-        val isSeries = href.contains("dizi", true) || href.contains("sezon", true) ||
-            href.contains("bolum", true) || title.contains("dizi", true)
 
         return if (isSeries) {
             newTvSeriesSearchResponse(title, href) {
@@ -111,19 +104,32 @@ class HintFilmIzle : MainAPI() {
         val episodes = document.select("a[href]").mapNotNull { a ->
             val href = a.absUrl("href")
             val text = a.text().replace(Regex("\\s+"), " ").trim()
-            val m = Regex(
-                "(\\d+)\\.?\\s*Bölüm.*?(\\d+)\\.?\\s*Sezon",
+            if (!href.startsWith(mainUrl)) return@mapNotNull null
+
+            val seasonEpisode = Regex(
+                "(\\d+)\\s*[.]?\\s*Sezon.*?(\\d+)\\s*[.]?\\s*Bölüm",
+                RegexOption.IGNORE_CASE
+            ).find(text)
+            val episodeSeason = Regex(
+                "(\\d+)\\s*[.]?\\s*Bölüm.*?(\\d+)\\s*[.]?\\s*Sezon",
                 RegexOption.IGNORE_CASE
             ).find(text)
 
-            if (m != null && href.startsWith(mainUrl)) {
-                Episode(
+            when {
+                seasonEpisode != null -> Episode(
                     name = text,
-                    season = m.groupValues[2].toIntOrNull() ?: 1,
-                    episode = m.groupValues[1].toIntOrNull() ?: 1,
+                    season = seasonEpisode.groupValues[1].toIntOrNull() ?: 1,
+                    episode = seasonEpisode.groupValues[2].toIntOrNull() ?: 1,
                     data = href
                 )
-            } else null
+                episodeSeason != null -> Episode(
+                    name = text,
+                    season = episodeSeason.groupValues[2].toIntOrNull() ?: 1,
+                    episode = episodeSeason.groupValues[1].toIntOrNull() ?: 1,
+                    data = href
+                )
+                else -> null
+            }
         }.distinctBy { it.data }
 
         return if (episodes.isNotEmpty()) {
@@ -139,12 +145,7 @@ class HintFilmIzle : MainAPI() {
         }
     }
 
-    /**
-     * HintFilmIzle'nin Kinescope oynatıcında gerçek HLS manifesti JavaScript
-     * tarafından imzalanarak oluşturuluyor. Normal HTTP GET ile iframe'i
-     * okumak bu yüzden yeterli değil. WebViewResolver tarayıcı isteğini
-     * yakalayıp imzalı .m3u8 URL'sini ve gerekli header'ları alıyor.
-     */
+    /** Kinescope signed HLS is generated by JavaScript, so WebView is required. */
     private suspend fun loadKinescope(
         iframeUrl: String,
         parentUrl: String,
@@ -154,9 +155,7 @@ class HintFilmIzle : MainAPI() {
         return try {
             val resolver = WebViewResolver(
                 interceptUrl = Regex("""\\.m3u8(?:\\?|$)"""),
-                additionalUrls = listOf(
-                    Regex("""kinescopecdn\\.net/hls/""")
-                ),
+                additionalUrls = listOf(Regex("""kinescopecdn\\.net/hls/""")),
                 userAgent = null,
                 useOkhttp = false,
                 timeout = 45_000L
@@ -174,7 +173,6 @@ class HintFilmIzle : MainAPI() {
             )
 
             if (finalRequest == null) return false
-
             val manifestUrl = finalRequest.url.toString()
             if (!manifestUrl.contains(".m3u8", ignoreCase = true)) return false
 
@@ -189,7 +187,6 @@ class HintFilmIzle : MainAPI() {
                 referer = iframeUrl,
                 headers = browserHeaders
             ).forEach(callback)
-
             true
         } catch (_: Throwable) {
             false
@@ -209,33 +206,24 @@ class HintFilmIzle : MainAPI() {
             val src = it.absUrl("src").ifBlank { it.absUrl("data-src") }
                 .takeIf { value -> value.isNotBlank() } ?: return@forEach
 
-            if (src.contains("kinescope", ignoreCase = true) ||
-                src.contains("kinescopecdn.net", ignoreCase = true)
-            ) {
+            if (src.contains("kinescope", ignoreCase = true) || src.contains("kinescopecdn.net", ignoreCase = true)) {
                 if (loadKinescope(src, data, subtitleCallback, callback)) {
                     found = true
                     return@forEach
                 }
             }
 
-            if (runCatching {
-                loadExtractor(src, data, subtitleCallback, callback)
-            }.getOrDefault(false)) {
+            if (runCatching { loadExtractor(src, data, subtitleCallback, callback) }.getOrDefault(false)) {
                 found = true
             }
         }
 
         document.select("a[href]").forEach {
             val href = it.absUrl("href")
-            if (href.contains("vidmoly", true) ||
-                href.contains("vidhide", true) ||
-                href.contains("streamtape", true) ||
-                href.contains("voe.sx", true) ||
-                href.contains("ok.ru", true)
+            if (href.contains("vidmoly", true) || href.contains("vidhide", true) ||
+                href.contains("streamtape", true) || href.contains("voe.sx", true) || href.contains("ok.ru", true)
             ) {
-                if (runCatching {
-                    loadExtractor(href, data, subtitleCallback, callback)
-                }.getOrDefault(false)) {
+                if (runCatching { loadExtractor(href, data, subtitleCallback, callback) }.getOrDefault(false)) {
                     found = true
                 }
             }
