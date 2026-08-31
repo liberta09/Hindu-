@@ -4,11 +4,12 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
+import java.net.URLEncoder
 
 class HintFilmIzle : MainAPI() {
     override var mainUrl = "https://www.hintfilmizle.com"
     override var name = "HintFilmİzle"
-    override val lang = "tr"
+    override var lang = "tr"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
     override val hasMainPage = true
     override val hasQuickSearch = true
@@ -41,21 +42,19 @@ class HintFilmIzle : MainAPI() {
         return newHomePageResponse(request.name, items, hasNext = items.size >= 20)
     }
 
-    override suspend fun search(query: String): List<SearchResponse> =
-        app.get(mainUrl + "/?s=" + query.urlEncode()).document
-            .select("main a[href], #content a[href], .content a[href], article a[href]")
-            .ifEmpty { app.get(mainUrl + "/?s=" + query.urlEncode()).document.select("a[href]") }
+    override suspend fun search(query: String): List<SearchResponse> {
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        val document = app.get("$mainUrl/?s=$encoded").document
+        return document.select("main a[href], #content a[href], .content a[href], article a[href]")
+            .ifEmpty { document.select("a[href]") }
             .mapNotNull { it.toSearchResponse() }
             .distinctBy { it.url }
             .take(40)
+    }
 
     private fun Element.toSearchResponse(): SearchResponse? {
         val href = absUrl("href").takeIf { it.startsWith(mainUrl) } ?: return null
         val path = href.removePrefix(mainUrl).substringBefore("?").removeSuffix("/")
-
-        // HintFilmIzle'de gerçek içerik URL'leri /film/ ve /diziler/ altında.
-        // Bu filtre, menü/filtre/oyuncu bağlantılarının katalog kartına
-        // dönüşmesini tamamen engeller.
         val isMovie = path.startsWith("/film/")
         val isSeries = path.startsWith("/diziler/")
         if (!isMovie && !isSeries) return null
@@ -92,11 +91,9 @@ class HintFilmIzle : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
-
         val title = document.selectFirst("h1")?.text()?.trim()
             ?: document.selectFirst("meta[property=og:title]")?.attr("content")?.trim()
             ?: url.substringAfterLast("/").replace("-", " ")
-
         val poster = document.selectFirst("meta[property=og:image]")?.attr("content")
         val plot = document.selectFirst("meta[name=description]")?.attr("content")
             ?: document.selectFirst(".entry-content, .film-description, .description")?.text()?.trim()
@@ -105,47 +102,36 @@ class HintFilmIzle : MainAPI() {
             val href = a.absUrl("href")
             val text = a.text().replace(Regex("\\s+"), " ").trim()
             if (!href.startsWith(mainUrl)) return@mapNotNull null
-
-            val seasonEpisode = Regex(
-                "(\\d+)\\s*[.]?\\s*Sezon.*?(\\d+)\\s*[.]?\\s*Bölüm",
-                RegexOption.IGNORE_CASE
-            ).find(text)
-            val episodeSeason = Regex(
-                "(\\d+)\\s*[.]?\\s*Bölüm.*?(\\d+)\\s*[.]?\\s*Sezon",
-                RegexOption.IGNORE_CASE
-            ).find(text)
-
+            val m1 = Regex("(\\d+)\\s*[.]?\\s*Sezon.*?(\\d+)\\s*[.]?\\s*Bölüm", RegexOption.IGNORE_CASE).find(text)
+            val m2 = Regex("(\\d+)\\s*[.]?\\s*Bölüm.*?(\\d+)\\s*[.]?\\s*Sezon", RegexOption.IGNORE_CASE).find(text)
             when {
-                seasonEpisode != null -> Episode(
-                    name = text,
-                    season = seasonEpisode.groupValues[1].toIntOrNull() ?: 1,
-                    episode = seasonEpisode.groupValues[2].toIntOrNull() ?: 1,
-                    data = href
-                )
-                episodeSeason != null -> Episode(
-                    name = text,
-                    season = episodeSeason.groupValues[2].toIntOrNull() ?: 1,
-                    episode = episodeSeason.groupValues[1].toIntOrNull() ?: 1,
-                    data = href
-                )
+                m1 != null -> newEpisode(href) {
+                    name = text
+                    season = m1.groupValues[1].toIntOrNull() ?: 1
+                    episode = m1.groupValues[2].toIntOrNull() ?: 1
+                }
+                m2 != null -> newEpisode(href) {
+                    name = text
+                    season = m2.groupValues[2].toIntOrNull() ?: 1
+                    episode = m2.groupValues[1].toIntOrNull() ?: 1
+                }
                 else -> null
             }
         }.distinctBy { it.data }
 
         return if (episodes.isNotEmpty()) {
             newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-                this.posterUrl = poster
+                posterUrl = poster
                 this.plot = plot
             }
         } else {
             newMovieLoadResponse(title, url, TvType.Movie, url) {
-                this.posterUrl = poster
+                posterUrl = poster
                 this.plot = plot
             }
         }
     }
 
-    /** Kinescope signed HLS is generated by JavaScript, so WebView is required. */
     private suspend fun loadKinescope(
         iframeUrl: String,
         parentUrl: String,
@@ -160,32 +146,22 @@ class HintFilmIzle : MainAPI() {
                 useOkhttp = false,
                 timeout = 45_000L
             )
-
-            val requestHeaders = mapOf(
-                "Referer" to parentUrl,
-                "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
-            )
-
             val (finalRequest, _) = resolver.resolveUsingWebView(
                 url = iframeUrl,
                 referer = parentUrl,
-                headers = requestHeaders
+                headers = mapOf("Referer" to parentUrl, "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8")
             )
-
             if (finalRequest == null) return false
             val manifestUrl = finalRequest.url.toString()
             if (!manifestUrl.contains(".m3u8", ignoreCase = true)) return false
-
             val browserHeaders = finalRequest.headers.toMap().toMutableMap()
-            if (browserHeaders.keys.none { it.equals("Referer", ignoreCase = true) }) {
-                browserHeaders["Referer"] = iframeUrl
-            }
-
+            if (browserHeaders.keys.none { it.equals("Referer", ignoreCase = true) }) browserHeaders["Referer"] = iframeUrl
             M3u8Helper.generateM3u8(
-                name = "HintFilmİzle - Kinescope",
+                source = "HintFilmİzle - Kinescope",
                 streamUrl = manifestUrl,
                 referer = iframeUrl,
-                headers = browserHeaders
+                headers = browserHeaders,
+                name = "Kinescope"
             ).forEach(callback)
             true
         } catch (_: Throwable) {
@@ -201,34 +177,22 @@ class HintFilmIzle : MainAPI() {
     ): Boolean {
         val document = app.get(data).document
         var found = false
-
         document.select("iframe[src], iframe[data-src], video[src], video source[src]").forEach {
-            val src = it.absUrl("src").ifBlank { it.absUrl("data-src") }
-                .takeIf { value -> value.isNotBlank() } ?: return@forEach
-
-            if (src.contains("kinescope", ignoreCase = true) || src.contains("kinescopecdn.net", ignoreCase = true)) {
+            val src = it.absUrl("src").ifBlank { it.absUrl("data-src") }.takeIf { it.isNotBlank() } ?: return@forEach
+            if (src.contains("kinescope", true) || src.contains("kinescopecdn.net", true)) {
                 if (loadKinescope(src, data, subtitleCallback, callback)) {
                     found = true
                     return@forEach
                 }
             }
-
-            if (runCatching { loadExtractor(src, data, subtitleCallback, callback) }.getOrDefault(false)) {
-                found = true
-            }
+            if (runCatching { loadExtractor(src, data, subtitleCallback, callback) }.getOrDefault(false)) found = true
         }
-
         document.select("a[href]").forEach {
             val href = it.absUrl("href")
-            if (href.contains("vidmoly", true) || href.contains("vidhide", true) ||
-                href.contains("streamtape", true) || href.contains("voe.sx", true) || href.contains("ok.ru", true)
-            ) {
-                if (runCatching { loadExtractor(href, data, subtitleCallback, callback) }.getOrDefault(false)) {
-                    found = true
-                }
+            if (href.contains("vidmoly", true) || href.contains("vidhide", true) || href.contains("streamtape", true) || href.contains("voe.sx", true) || href.contains("ok.ru", true)) {
+                if (runCatching { loadExtractor(href, data, subtitleCallback, callback) }.getOrDefault(false)) found = true
             }
         }
-
         return found
     }
 }
